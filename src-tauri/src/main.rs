@@ -5,6 +5,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
@@ -16,10 +17,24 @@ use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager};
 
 static APP_STATE: Lazy<AppState> = Lazy::new(AppState::default);
+const DEFAULT_WORKSPACE_SLUG: &str = "content-shotgun";
+const LEGACY_DEFAULT_WORKSPACE_SLUG: &str = "dockhub";
+const DEFAULT_WORKSPACE_TITLE: &str = "Content Shotgun";
+const DEFAULT_WORKSPACE_CHANNELS: [&str; 6] = ["instagram", "facebook", "email", "blog", "ad", "sms"];
+const DEFAULT_PARENT_INSTRUCTIONS_MD: &str = include_str!("../../contracts/templates/instructions.md");
+const DEFAULT_WORKSPACE_BRIEF_MD: &str = include_str!("../../contracts/templates/workspace.md");
+const DEFAULT_MASTER_MD: &str = include_str!("../../contracts/templates/master.md");
 
-#[derive(Default)]
 struct AppState {
     inner: Mutex<InnerState>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(InnerState::default()),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -106,10 +121,18 @@ struct TaskManifest {
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
-struct FileReviewState {
+struct DerivativeWorkflowState {
     status: Option<String>,
-    reviewed: Option<bool>,
     notes: Option<String>,
+    deployed_channels: Option<Vec<String>>,
+    #[serde(default)]
+    reviewed: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct MasterWorkflowState {
+    status: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -126,7 +149,10 @@ struct DeploymentEntry {
 #[serde(rename_all = "camelCase")]
 struct TopicMetadata {
     tags: Option<Vec<String>>,
-    files: Option<std::collections::HashMap<String, FileReviewState>>,
+    #[serde(default)]
+    master: Option<MasterWorkflowState>,
+    files: Option<std::collections::HashMap<String, DerivativeWorkflowState>>,
+    #[serde(default)]
     deployments: Option<std::collections::HashMap<String, Vec<DeploymentEntry>>>,
 }
 
@@ -138,6 +164,7 @@ struct DerivativeEntry {
     kind: String,
     status: String,
     deployed_count: usize,
+    deployed_channels: Vec<String>,
     modified_at: i64,
 }
 
@@ -148,6 +175,7 @@ struct AssetEntry {
     abs_path: String,
     modified_at: i64,
     is_image: bool,
+    is_video: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -174,18 +202,34 @@ struct TopicDetail {
     topic_status: String,
     tags: Vec<String>,
     master_file: Option<String>,
+    master_status: String,
+    master_modified_at: Option<i64>,
     derivatives: Vec<DerivativeEntry>,
     assets: Vec<AssetEntry>,
-    deployments: std::collections::HashMap<String, Vec<DeploymentEntry>>,
 }
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct DerivativeState {
     status: String,
-    reviewed: bool,
     notes: String,
-    deployments: Vec<DeploymentEntry>,
+    deployed_channels: Vec<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceEntry {
+    slug: String,
+    title: String,
+    path: String,
+    channels: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceConfig {
+    title: Option<String>,
+    channels: Option<Vec<String>>,
 }
 
 fn now_iso() -> String {
@@ -216,7 +260,44 @@ fn humanize_slug(slug: &str) -> String {
 }
 
 fn normalize_workspace_root(input: &Path) -> PathBuf {
-    let mut root = input.to_path_buf();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut root = if input.is_absolute() {
+        input.to_path_buf()
+    } else {
+        let candidate = cwd.join(input);
+        let in_src_tauri = cwd
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n == "src-tauri")
+            .unwrap_or(false);
+        if in_src_tauri {
+            let parent_candidate = cwd.parent().unwrap_or(&cwd).join(input);
+            parent_candidate
+        } else {
+            candidate
+        }
+    };
+
+    if !root.exists() {
+        let trimmed = input.to_string_lossy().trim_start_matches('/').to_string();
+        if !trimmed.is_empty() {
+            let candidate = cwd.join(&trimmed);
+            if candidate.exists() {
+                root = candidate;
+            } else if cwd
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n == "src-tauri")
+                .unwrap_or(false)
+            {
+                let parent_candidate = cwd.parent().unwrap_or(&cwd).join(&trimmed);
+                if parent_candidate.exists() {
+                    root = parent_candidate;
+                }
+            }
+        }
+    }
+
     if root.is_file() {
         if let Some(parent) = root.parent() {
             root = parent.to_path_buf();
@@ -243,6 +324,46 @@ fn normalize_workspace_root(input: &Path) -> PathBuf {
     root
 }
 
+fn unique_name_in_dir(dir: &Path, file_name: &str) -> PathBuf {
+    let candidate = dir.join(file_name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let path = Path::new(file_name);
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    for i in 2..10_000 {
+        let next_name = if ext.is_empty() {
+            format!("{}-{}", stem, i)
+        } else {
+            format!("{}-{}.{}", stem, i, ext)
+        };
+        let next = dir.join(next_name);
+        if !next.exists() {
+            return next;
+        }
+    }
+    dir.join(format!("{}-copy", stem))
+}
+
+fn normalize_topic_rel_path(rel_path: &str) -> Result<String> {
+    let trimmed = rel_path.trim().replace('\\', "/");
+    if trimmed.is_empty() {
+        return Err(anyhow!("path is empty"));
+    }
+    if trimmed.starts_with('/') {
+        return Err(anyhow!("absolute paths are not allowed"));
+    }
+    let candidate = Path::new(&trimmed);
+    if candidate
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(anyhow!("parent path segments are not allowed"));
+    }
+    Ok(trimmed)
+}
+
 fn read_topic_metadata(topic_dir: &Path) -> TopicMetadata {
     let raw = fs::read_to_string(topic_dir.join("topic.json"));
     match raw {
@@ -256,6 +377,153 @@ fn write_topic_metadata(topic_dir: &Path, metadata: &TopicMetadata) -> Result<()
         topic_dir.join("topic.json"),
         serde_json::to_vec_pretty(metadata)?,
     )?;
+    Ok(())
+}
+
+fn default_topic_metadata() -> TopicMetadata {
+    TopicMetadata {
+        tags: Some(vec![]),
+        master: Some(MasterWorkflowState {
+            status: Some("Draft".to_string()),
+        }),
+        files: Some(std::collections::HashMap::new()),
+        deployments: None,
+    }
+}
+
+fn ensure_text_file_if_missing(path: &Path, content: &str) -> Result<()> {
+    if path.exists() {
+        if path.is_file() {
+            return Ok(());
+        }
+        return Err(anyhow!(
+            "expected file but found directory: {}",
+            path.to_string_lossy()
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, content)?;
+    Ok(())
+}
+
+fn ensure_topic_contract_files(topic_dir: &Path) -> Result<()> {
+    fs::create_dir_all(topic_dir)?;
+    fs::create_dir_all(topic_dir.join("assets"))?;
+    if !topic_dir.join("topic.json").exists() {
+        write_topic_metadata(topic_dir, &default_topic_metadata())?;
+    }
+    Ok(())
+}
+
+fn topic_contract_block_reason(rel_path: &str) -> Option<&'static str> {
+    if rel_path.eq_ignore_ascii_case("topic.json") {
+        return Some(
+            "topic.json is protected contract metadata and cannot be changed with this action",
+        );
+    }
+    if rel_path.eq_ignore_ascii_case("master.md") {
+        return Some(
+            "master.md is a required contract file and cannot be changed with this action; use the master update flow instead",
+        );
+    }
+    let lower = rel_path.to_ascii_lowercase();
+    if lower == "assets" || lower.starts_with("assets/") {
+        return Some("assets/ is protected in this flow; add assets via the add-assets operation");
+    }
+    None
+}
+
+fn render_blank_master_template(topic_name: &str, topic_slug: &str) -> String {
+    DEFAULT_MASTER_MD
+        .replace("{{TOPIC_TITLE}}", topic_name)
+        .replace("{{TOPIC_SLUG}}", topic_slug)
+}
+
+fn delete_topic_master_and_derivatives(topic_dir: &Path) -> Result<usize> {
+    let master_path = topic_dir.join("master.md");
+    if !master_path.exists() {
+        return Err(anyhow!("master.md not found"));
+    }
+
+    let mut derivative_paths: Vec<(String, PathBuf)> = Vec::new();
+    for entry in walkdir::WalkDir::new(topic_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path().to_path_buf();
+        let rel = relative_unix(topic_dir, &path);
+        let lower = rel.to_ascii_lowercase();
+        if lower == "topic.json" || lower == "master.md" || lower.starts_with("assets/") {
+            continue;
+        }
+        derivative_paths.push((rel, path));
+    }
+
+    for (_, derivative) in &derivative_paths {
+        fs::remove_file(derivative)?;
+    }
+    fs::remove_file(&master_path)?;
+
+    let mut metadata = read_topic_metadata(topic_dir);
+    if let Some(files) = metadata.files.as_mut() {
+        files.retain(|rel, _| topic_dir.join(rel).exists());
+    }
+    if let Some(deployments) = metadata.deployments.as_mut() {
+        deployments.retain(|rel, _| topic_dir.join(rel).exists());
+    }
+    metadata.master = Some(MasterWorkflowState {
+        status: Some("Draft".to_string()),
+    });
+    write_topic_metadata(topic_dir, &metadata)?;
+
+    let assets_root = topic_dir.join("assets");
+    let mut dirs: Vec<PathBuf> = walkdir::WalkDir::new(topic_dir)
+        .min_depth(1)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_dir())
+        .map(|entry| entry.path().to_path_buf())
+        .collect();
+    dirs.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+    for dir in dirs {
+        if dir == assets_root || dir.starts_with(&assets_root) {
+            continue;
+        }
+        if fs::read_dir(&dir)?.next().is_none() {
+            fs::remove_dir(&dir)?;
+        }
+    }
+
+    Ok(derivative_paths.len())
+}
+
+fn topic_has_master_file(topic_dir: &Path) -> bool {
+    topic_dir.join("master.md").exists()
+        || topic_dir.join("master.html").exists()
+        || topic_dir.join("master.htm").exists()
+}
+
+fn ensure_master_metadata(topic_dir: &Path, metadata: &mut TopicMetadata) -> Result<()> {
+    if !topic_has_master_file(topic_dir) {
+        return Ok(());
+    }
+    let has_master_status = metadata
+        .master
+        .as_ref()
+        .and_then(|master| master.status.as_deref())
+        .is_some();
+    if has_master_status {
+        return Ok(());
+    }
+    metadata.master = Some(MasterWorkflowState {
+        status: Some("Draft".to_string()),
+    });
+    write_topic_metadata(topic_dir, metadata)?;
     Ok(())
 }
 
@@ -283,6 +551,18 @@ fn is_image_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn is_video_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "mov" | "qt" | "mp4" | "m4v" | "webm"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn relative_unix(base: &Path, path: &Path) -> String {
     path.strip_prefix(base)
         .unwrap_or(path)
@@ -296,7 +576,11 @@ fn derivative_kind(rel_path: &str) -> String {
         "Blog".to_string()
     } else if lower.contains("email") {
         "Email".to_string()
-    } else if lower.contains("social") || lower.contains("linkedin") || lower.contains("instagram") || lower.contains("facebook") {
+    } else if lower.contains("social")
+        || lower.contains("linkedin")
+        || lower.contains("instagram")
+        || lower.contains("facebook")
+    {
         "Social".to_string()
     } else {
         "General".to_string()
@@ -311,34 +595,104 @@ fn display_title_from_filename(path: &str) -> String {
     humanize_slug(&slugify(stem))
 }
 
+fn normalize_derivative_status(value: Option<&str>) -> String {
+    let raw = value.unwrap_or("Draft").trim();
+    if raw.eq_ignore_ascii_case("deployed") {
+        "Deployed".to_string()
+    } else if raw.eq_ignore_ascii_case("revised") || raw.eq_ignore_ascii_case("ready") {
+        "Revised".to_string()
+    } else {
+        "Draft".to_string()
+    }
+}
+
+fn normalize_master_status(value: Option<&str>) -> String {
+    let raw = value.unwrap_or("Draft").trim();
+    if raw.eq_ignore_ascii_case("ready") || raw.eq_ignore_ascii_case("revised") {
+        "Ready".to_string()
+    } else {
+        "Draft".to_string()
+    }
+}
+
+fn normalize_channels(input: Vec<String>) -> Vec<String> {
+    let mut dedup = HashSet::new();
+    input
+        .into_iter()
+        .map(|channel| channel.trim().to_string())
+        .filter(|channel| !channel.is_empty())
+        .filter(|channel| dedup.insert(channel.to_ascii_lowercase()))
+        .collect()
+}
+
+fn default_channels_for_workspace_slug(slug: &str) -> Vec<String> {
+    if slug.eq_ignore_ascii_case(DEFAULT_WORKSPACE_SLUG)
+        || slug.eq_ignore_ascii_case(LEGACY_DEFAULT_WORKSPACE_SLUG)
+    {
+        DEFAULT_WORKSPACE_CHANNELS
+            .iter()
+            .map(|channel| (*channel).to_string())
+            .collect()
+    } else {
+        vec![]
+    }
+}
+
+fn resolve_workspace_channels(slug: &str, channels: Option<Vec<String>>) -> Vec<String> {
+    let normalized = normalize_channels(channels.unwrap_or_default());
+    if normalized.is_empty() {
+        return default_channels_for_workspace_slug(slug);
+    }
+    normalized
+}
+
+fn deployed_channels_for_file(rel_path: &str, metadata: &TopicMetadata) -> Vec<String> {
+    let from_state = metadata
+        .files
+        .as_ref()
+        .and_then(|m| m.get(rel_path))
+        .and_then(|state| state.deployed_channels.clone())
+        .map(normalize_channels)
+        .unwrap_or_default();
+    if !from_state.is_empty() {
+        return from_state;
+    }
+
+    metadata
+        .deployments
+        .as_ref()
+        .and_then(|m| m.get(rel_path))
+        .map(|entries| {
+            normalize_channels(
+                entries
+                    .iter()
+                    .map(|entry| entry.destination.clone())
+                    .collect::<Vec<String>>(),
+            )
+        })
+        .unwrap_or_default()
+}
+
 fn derive_file_status(
     rel_path: &str,
     metadata: &TopicMetadata,
     modified_at: i64,
-    last_scan_cutoff: i64,
+    _last_scan_cutoff: i64,
 ) -> String {
-    let deployments = metadata
-        .deployments
-        .as_ref()
-        .and_then(|m| m.get(rel_path))
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    if deployments {
+    let deployed_channels = deployed_channels_for_file(rel_path, metadata);
+    if !deployed_channels.is_empty() {
         return "Deployed".to_string();
     }
-    if let Some(state) = metadata
+    if let Some(status) = metadata
         .files
         .as_ref()
         .and_then(|m| m.get(rel_path))
-        .and_then(|s| s.status.clone())
+        .and_then(|s| s.status.as_deref())
     {
-        return state;
+        return normalize_derivative_status(Some(status));
     }
-    if modified_at >= last_scan_cutoff {
-        "New".to_string()
-    } else {
-        "Review".to_string()
-    }
+    let _ = modified_at;
+    "Draft".to_string()
 }
 
 fn slugify(input: &str) -> String {
@@ -358,7 +712,10 @@ fn slugify(input: &str) -> String {
 }
 
 fn db_conn(db_path: &Path) -> Result<Connection> {
-    Connection::open(db_path).context("failed opening sqlite")
+    let conn = Connection::open(db_path).context("failed opening sqlite")?;
+    conn.busy_timeout(Duration::from_secs(3))
+        .context("failed configuring sqlite busy timeout")?;
+    Ok(conn)
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
@@ -420,6 +777,7 @@ fn migrate(conn: &Connection) -> Result<()> {
           payload_json TEXT NOT NULL,
           created_at TEXT NOT NULL
         );
+
         "#,
     )?;
     Ok(())
@@ -430,33 +788,103 @@ fn ensure_workspace(root: &Path) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf)>
     let projects = root.join("projects");
     let exports = root.join("exports");
     let data = root.join("data");
+    let knowledge = root.join("knowledge");
 
     fs::create_dir_all(&inbox)?;
     fs::create_dir_all(&projects)?;
     fs::create_dir_all(&exports)?;
     fs::create_dir_all(&data)?;
+    fs::create_dir_all(&knowledge)?;
+    ensure_text_file_if_missing(&knowledge.join("workspace.md"), DEFAULT_WORKSPACE_BRIEF_MD)?;
 
     Ok((inbox, projects, exports, data.join("app.db")))
+}
+
+fn workspace_parent_root(input: &Path) -> PathBuf {
+    normalize_workspace_root(input)
+}
+
+fn ensure_workspace_parent_contract(parent_root: &Path) -> Result<()> {
+    fs::create_dir_all(parent_root)?;
+    ensure_text_file_if_missing(
+        &parent_root.join("instructions.md"),
+        DEFAULT_PARENT_INSTRUCTIONS_MD,
+    )?;
+    fs::create_dir_all(parent_root.join("workspaces"))?;
+    Ok(())
+}
+
+fn workspace_parent_from_workspace_root(workspace_root: &Path) -> Option<PathBuf> {
+    let container = workspace_root.parent()?;
+    if !container
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|name| name.eq_ignore_ascii_case("workspaces"))
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    container.parent().map(|parent| parent.to_path_buf())
+}
+
+fn workspace_roots_container(parent_root: &Path) -> PathBuf {
+    parent_root.join("workspaces")
+}
+
+fn workspace_root_path(parent_root: &Path, slug: &str) -> PathBuf {
+    workspace_roots_container(parent_root).join(slugify(slug))
+}
+
+fn workspace_config_path(workspace_root: &Path) -> PathBuf {
+    workspace_root.join("workspace.json")
+}
+
+fn read_workspace_config(workspace_root: &Path) -> WorkspaceConfig {
+    let raw = fs::read_to_string(workspace_config_path(workspace_root));
+    match raw {
+        Ok(content) => serde_json::from_str::<WorkspaceConfig>(&content).unwrap_or_default(),
+        Err(_) => WorkspaceConfig::default(),
+    }
+}
+
+fn write_workspace_config(workspace_root: &Path, config: &WorkspaceConfig) -> Result<()> {
+    fs::write(
+        workspace_config_path(workspace_root),
+        serde_json::to_vec_pretty(config)?,
+    )?;
+    Ok(())
 }
 
 fn with_state_paths(state: &AppState) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf, PathBuf)> {
     let guard = state.inner.lock().map_err(|_| anyhow!("state poisoned"))?;
     Ok((
-        guard.root_path.clone().ok_or_else(|| anyhow!("workspace not initialized"))?,
-        guard.inbox_path.clone().ok_or_else(|| anyhow!("workspace not initialized"))?,
-        guard.projects_path.clone().ok_or_else(|| anyhow!("workspace not initialized"))?,
-        guard.exports_path.clone().ok_or_else(|| anyhow!("workspace not initialized"))?,
-        guard.db_path.clone().ok_or_else(|| anyhow!("workspace not initialized"))?,
+        guard
+            .root_path
+            .clone()
+            .ok_or_else(|| anyhow!("workspace not initialized"))?,
+        guard
+            .inbox_path
+            .clone()
+            .ok_or_else(|| anyhow!("workspace not initialized"))?,
+        guard
+            .projects_path
+            .clone()
+            .ok_or_else(|| anyhow!("workspace not initialized"))?,
+        guard
+            .exports_path
+            .clone()
+            .ok_or_else(|| anyhow!("workspace not initialized"))?,
+        guard
+            .db_path
+            .clone()
+            .ok_or_else(|| anyhow!("workspace not initialized"))?,
     ))
 }
 
 fn status_transition_allowed(from: &str, to: &str) -> bool {
     matches!(
         (from, to),
-        ("Draft", "Review")
-            | ("Review", "Draft")
-            | ("Review", "Final")
-            | ("Final", "Review")
+        ("Draft", "Review") | ("Review", "Draft") | ("Review", "Final") | ("Final", "Review")
     )
 }
 
@@ -515,7 +943,10 @@ fn get_or_create_task(
         .and_then(|s| s.to_str())
         .ok_or_else(|| anyhow!("invalid filename"))?;
     let slug = slugify(stem);
-    let title = manifest.title.clone().unwrap_or_else(|| stem.replace('-', " "));
+    let title = manifest
+        .title
+        .clone()
+        .unwrap_or_else(|| stem.replace('-', " "));
 
     let existing: Option<i64> = conn
         .query_row(
@@ -601,7 +1032,10 @@ fn import_project_folder(
         let task_dir = projects_root.join(project_slug).join(&task_slug);
         fs::create_dir_all(&task_dir)?;
 
-        let stem = html.file_stem().and_then(|s| s.to_str()).unwrap_or("content");
+        let stem = html
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("content");
 
         let mut files_to_copy = vec![html.clone()];
         for ext in ["md", "txt"] {
@@ -613,7 +1047,10 @@ fn import_project_folder(
 
         let images_dir = project_folder.join("images");
         if images_dir.exists() {
-            for entry in walkdir::WalkDir::new(&images_dir).into_iter().filter_map(Result::ok) {
+            for entry in walkdir::WalkDir::new(&images_dir)
+                .into_iter()
+                .filter_map(Result::ok)
+            {
                 if entry.file_type().is_file() {
                     files_to_copy.push(entry.path().to_path_buf());
                 }
@@ -730,18 +1167,25 @@ fn build_export_bundle(state: &AppState, task_id: i64) -> Result<String> {
         WHERE t.id = ?
         "#,
         params![task_id],
-        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        },
     )?;
 
     let (title, task_slug, project_slug) = row;
-    let bundle = exports_path
-        .join(&project_slug)
-        .join(format!("{}-{}", task_slug, Utc::now().format("%Y%m%d%H%M%S")));
+    let bundle = exports_path.join(&project_slug).join(format!(
+        "{}-{}",
+        task_slug,
+        Utc::now().format("%Y%m%d%H%M%S")
+    ));
     fs::create_dir_all(bundle.join("assets"))?;
 
-    let mut stmt = conn.prepare(
-        "SELECT rel_path, abs_path FROM files WHERE task_id = ? ORDER BY rel_path ASC",
-    )?;
+    let mut stmt = conn
+        .prepare("SELECT rel_path, abs_path FROM files WHERE task_id = ? ORDER BY rel_path ASC")?;
     let mut rows = stmt.query(params![task_id])?;
     let mut formats = vec![];
 
@@ -774,11 +1218,19 @@ fn build_export_bundle(state: &AppState, task_id: i64) -> Result<String> {
         "exported_at": now_iso(),
         "formats": formats
     });
-    fs::write(bundle.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;
+    fs::write(
+        bundle.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
 
     conn.execute(
         "INSERT INTO exports (task_id, export_path, formats, created_at) VALUES (?, ?, ?, ?)",
-        params![task_id, bundle.to_string_lossy(), manifest["formats"].to_string(), now_iso()],
+        params![
+            task_id,
+            bundle.to_string_lossy(),
+            manifest["formats"].to_string(),
+            now_iso()
+        ],
     )?;
 
     log_event(
@@ -869,16 +1321,28 @@ fn scan_topic(topic_dir: &Path) -> Result<TopicDetail> {
         .and_then(|n| n.to_str())
         .ok_or_else(|| anyhow!("invalid topic path"))?
         .to_string();
-    let metadata = read_topic_metadata(topic_dir);
+    ensure_topic_contract_files(topic_dir)?;
+    let mut metadata = read_topic_metadata(topic_dir);
+    ensure_master_metadata(topic_dir, &mut metadata)?;
+    let master_status = normalize_master_status(
+        metadata
+            .master
+            .as_ref()
+            .and_then(|master| master.status.as_deref()),
+    );
     let cutoff = Utc::now().timestamp() - 86_400;
 
     let mut master_file: Option<String> = None;
+    let mut master_modified_at: Option<i64> = None;
     let mut derivatives: Vec<DerivativeEntry> = vec![];
     let mut assets: Vec<AssetEntry> = vec![];
     let mut last_agent_write = 0i64;
     let mut last_modified = unix_mtime(topic_dir);
 
-    for entry in walkdir::WalkDir::new(topic_dir).into_iter().filter_map(Result::ok) {
+    for entry in walkdir::WalkDir::new(topic_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
         if !entry.file_type().is_file() {
             continue;
         }
@@ -898,33 +1362,35 @@ fn scan_topic(topic_dir: &Path) -> Result<TopicDetail> {
                 abs_path: path.to_string_lossy().to_string(),
                 modified_at,
                 is_image: is_image_file(&path),
+                is_video: is_video_file(&path),
             });
             continue;
         }
 
-        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
         if file_name.eq_ignore_ascii_case("master.md")
             || file_name.eq_ignore_ascii_case("master.html")
             || file_name.eq_ignore_ascii_case("master.htm")
         {
             master_file = Some(rel.clone());
+            master_modified_at = Some(modified_at);
             continue;
         }
 
         if is_content_file(&path) {
+            let deployed_channels = deployed_channels_for_file(&rel, &metadata);
             let status = derive_file_status(&rel, &metadata, modified_at, cutoff);
-            let deployed_count = metadata
-                .deployments
-                .as_ref()
-                .and_then(|d| d.get(&rel))
-                .map(|v| v.len())
-                .unwrap_or(0);
+            let deployed_count = deployed_channels.len();
             derivatives.push(DerivativeEntry {
                 rel_path: rel.clone(),
                 title: display_title_from_filename(&rel),
                 kind: derivative_kind(&rel),
                 status,
                 deployed_count,
+                deployed_channels,
                 modified_at,
             });
         }
@@ -933,9 +1399,12 @@ fn scan_topic(topic_dir: &Path) -> Result<TopicDetail> {
     derivatives.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
     assets.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
 
-    let all_deployed = !derivatives.is_empty() && derivatives.iter().all(|d| d.status == "Deployed");
-    let all_ready_or_deployed =
-        !derivatives.is_empty() && derivatives.iter().all(|d| d.status == "Ready" || d.status == "Deployed");
+    let all_deployed =
+        !derivatives.is_empty() && derivatives.iter().all(|d| d.status == "Deployed");
+    let all_ready_or_deployed = !derivatives.is_empty()
+        && derivatives
+            .iter()
+            .all(|d| d.status == "Revised" || d.status == "Deployed");
 
     let topic_status = if all_deployed {
         "Deployed".to_string()
@@ -954,9 +1423,10 @@ fn scan_topic(topic_dir: &Path) -> Result<TopicDetail> {
         topic_status,
         tags: metadata.tags.unwrap_or_default(),
         master_file,
+        master_status,
+        master_modified_at,
         derivatives,
         assets,
-        deployments: metadata.deployments.unwrap_or_default(),
     })
 }
 
@@ -982,7 +1452,7 @@ fn list_topics_from_inbox(inbox: &Path) -> Result<Vec<TopicSummary>> {
             review_count: detail
                 .derivatives
                 .iter()
-                .filter(|d| d.status == "New" || d.status == "Review")
+                .filter(|d| d.status == "Draft")
                 .count(),
         });
     }
@@ -995,44 +1465,108 @@ fn topic_dir_from_slug(state: &AppState, slug: &str) -> Result<PathBuf> {
     Ok(inbox.join(slug))
 }
 
-#[tauri::command]
-fn create_topic(
-    topic_name: String,
-    master_format: Option<String>,
-    master_content: Option<String>,
-) -> Result<TopicDetail, String> {
-    let (_, inbox, _, _, db_path) = with_state_paths(&APP_STATE).map_err(|e| e.to_string())?;
-    let topic_slug = slugify(&topic_name);
+fn create_topic_in_inbox(
+    inbox: &Path,
+    topic_name: &str,
+    master_source_path: Option<String>,
+    asset_source_paths: Option<Vec<String>>,
+) -> Result<(String, PathBuf, String, usize)> {
+    let topic_slug = slugify(topic_name);
     if topic_slug.is_empty() {
-        return Err("topic name is empty".to_string());
+        return Err(anyhow!("topic name is empty"));
     }
+
+    let normalized_master_source = master_source_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+
+    let validated_master_source = if let Some(source) = normalized_master_source {
+        let source_path = PathBuf::from(&source);
+        if !source_path.exists() || !source_path.is_file() {
+            return Err(anyhow!(
+                "master source not found: {}",
+                source_path.to_string_lossy()
+            ));
+        }
+        let ext = source_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if ext != "md" && ext != "markdown" {
+            return Err(anyhow!("master article must be a markdown file (.md)"));
+        }
+        Some((source_path, source))
+    } else {
+        None
+    };
 
     let topic_dir = inbox.join(&topic_slug);
     if topic_dir.exists() {
-        return Err(format!("topic '{}' already exists", topic_slug));
+        return Err(anyhow!("topic '{}' already exists", topic_slug));
     }
 
-    fs::create_dir_all(topic_dir.join("assets")).map_err(|e| e.to_string())?;
-    let format = master_format.unwrap_or_else(|| "none".to_string()).to_ascii_lowercase();
-    if format == "md" || format == "markdown" {
-        let content = master_content.unwrap_or_else(|| format!("# {}\n\n", topic_name));
-        fs::write(topic_dir.join("master.md"), content).map_err(|e| e.to_string())?;
-    } else if format == "html" || format == "htm" {
-        let content = master_content.unwrap_or_else(|| {
-            format!(
-                "<h1>{}</h1>\n<p>Master brief for this topic.</p>\n",
-                topic_name
-            )
-        });
-        fs::write(topic_dir.join("master.html"), content).map_err(|e| e.to_string())?;
-    }
+    let creation_result: Result<(String, usize)> = (|| {
+        ensure_topic_contract_files(&topic_dir)?;
 
-    let metadata = TopicMetadata {
-        tags: Some(vec![]),
-        files: Some(std::collections::HashMap::new()),
-        deployments: Some(std::collections::HashMap::new()),
-    };
-    write_topic_metadata(&topic_dir, &metadata).map_err(|e| e.to_string())?;
+        let source = if let Some((source_path, source_label)) = validated_master_source {
+            fs::copy(&source_path, topic_dir.join("master.md"))?;
+            source_label
+        } else {
+            let blank_master = render_blank_master_template(topic_name, &topic_slug);
+            fs::write(topic_dir.join("master.md"), blank_master)?;
+            "__generated_template__".to_string()
+        };
+        if !topic_dir.join("master.md").exists() {
+            return Err(anyhow!("failed to create master.md for new topic"));
+        }
+
+        let mut assets_added = 0usize;
+        if let Some(paths) = asset_source_paths {
+            let assets_dir = topic_dir.join("assets");
+            for source in paths {
+                let source_path = PathBuf::from(source);
+                if !source_path.exists() || !source_path.is_file() {
+                    continue;
+                }
+                let name = source_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("asset.bin");
+                let target = unique_name_in_dir(&assets_dir, name);
+                fs::copy(&source_path, &target)?;
+                assets_added += 1;
+            }
+        }
+        write_topic_metadata(&topic_dir, &default_topic_metadata())?;
+        Ok((source, assets_added))
+    })();
+
+    match creation_result {
+        Ok((source, assets_added)) => Ok((topic_slug, topic_dir, source, assets_added)),
+        Err(error) => {
+            let _ = fs::remove_dir_all(&topic_dir);
+            Err(error)
+        }
+    }
+}
+
+#[tauri::command]
+fn create_topic(
+    topic_name: String,
+    master_source_path: Option<String>,
+    asset_source_paths: Option<Vec<String>>,
+) -> Result<TopicDetail, String> {
+    let (_, inbox, _, _, db_path) = with_state_paths(&APP_STATE).map_err(|e| e.to_string())?;
+    let (topic_slug, topic_dir, source, assets_added) = create_topic_in_inbox(
+        &inbox,
+        &topic_name,
+        master_source_path,
+        asset_source_paths,
+    )
+    .map_err(|e| e.to_string())?;
 
     let conn = db_conn(&db_path).map_err(|e| e.to_string())?;
     log_event(
@@ -1041,7 +1575,8 @@ fn create_topic(
         serde_json::json!({
             "topic_slug": topic_slug,
             "topic_name": topic_name,
-            "master_format": format
+            "master_source_path": source,
+            "assets_added": assets_added
         }),
     )
     .map_err(|e| e.to_string())?;
@@ -1050,15 +1585,468 @@ fn create_topic(
 }
 
 #[tauri::command]
+fn delete_topic(topic_slug: String) -> Result<(), String> {
+    let topic_dir = topic_dir_from_slug(&APP_STATE, &topic_slug).map_err(|e| e.to_string())?;
+    if !topic_dir.exists() {
+        return Err(format!("topic '{}' not found", topic_slug));
+    }
+    fs::remove_dir_all(&topic_dir).map_err(|e| e.to_string())?;
+
+    let (_, _, _, _, db_path) = with_state_paths(&APP_STATE).map_err(|e| e.to_string())?;
+    let conn = db_conn(&db_path).map_err(|e| e.to_string())?;
+    log_event(
+        &conn,
+        "topic.deleted",
+        serde_json::json!({
+            "topic_slug": topic_slug
+        }),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn list_workspaces(parent_root_path: String) -> Result<Vec<WorkspaceEntry>, String> {
+    let parent_root = workspace_parent_root(&PathBuf::from(parent_root_path));
+    let container = workspace_roots_container(&parent_root);
+    ensure_workspace_parent_contract(&parent_root).map_err(|e| e.to_string())?;
+
+    let mut entries = Vec::new();
+    let default_child_root = workspace_root_path(&parent_root, DEFAULT_WORKSPACE_SLUG);
+    let legacy_inbox = parent_root.join("inbox");
+    if legacy_inbox.exists() && !default_child_root.exists() {
+        let config = read_workspace_config(&parent_root);
+        entries.push(WorkspaceEntry {
+            slug: DEFAULT_WORKSPACE_SLUG.to_string(),
+            title: config
+                .title
+                .unwrap_or_else(|| DEFAULT_WORKSPACE_TITLE.to_string()),
+            path: parent_root.to_string_lossy().to_string(),
+            channels: resolve_workspace_channels(DEFAULT_WORKSPACE_SLUG, config.channels),
+        });
+    }
+
+    for entry in fs::read_dir(&container).map_err(|e| e.to_string())? {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        if !path.is_dir() {
+            continue;
+        }
+        ensure_workspace(&path).map_err(|e| e.to_string())?;
+        let slug = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if slug.is_empty() {
+            continue;
+        }
+        if !workspace_config_path(&path).exists() {
+            write_workspace_config(
+                &path,
+                &WorkspaceConfig {
+                    title: Some(humanize_slug(&slug)),
+                    channels: Some(default_channels_for_workspace_slug(&slug)),
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        let config = read_workspace_config(&path);
+        entries.push(WorkspaceEntry {
+            title: config.title.unwrap_or_else(|| humanize_slug(&slug)),
+            slug: slug.clone(),
+            path: path.to_string_lossy().to_string(),
+            channels: resolve_workspace_channels(&slug, config.channels),
+        });
+    }
+
+    if entries.is_empty() {
+        ensure_workspace(&default_child_root).map_err(|e| e.to_string())?;
+        write_workspace_config(
+            &default_child_root,
+            &WorkspaceConfig {
+                title: Some(DEFAULT_WORKSPACE_TITLE.to_string()),
+                channels: Some(default_channels_for_workspace_slug(DEFAULT_WORKSPACE_SLUG)),
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        let default_channels = default_channels_for_workspace_slug(DEFAULT_WORKSPACE_SLUG);
+        entries.push(WorkspaceEntry {
+            slug: DEFAULT_WORKSPACE_SLUG.to_string(),
+            title: DEFAULT_WORKSPACE_TITLE.to_string(),
+            path: default_child_root.to_string_lossy().to_string(),
+            channels: default_channels,
+        });
+    }
+
+    entries.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+    Ok(entries)
+}
+
+#[tauri::command]
+fn create_workspace(
+    parent_root_path: String,
+    workspace_name: String,
+) -> Result<WorkspaceEntry, String> {
+    let parent_root = workspace_parent_root(&PathBuf::from(parent_root_path));
+    ensure_workspace_parent_contract(&parent_root).map_err(|e| e.to_string())?;
+    let slug = slugify(&workspace_name);
+    if slug.is_empty() {
+        return Err("workspace name is empty".to_string());
+    }
+    let root = workspace_root_path(&parent_root, &slug);
+    ensure_workspace(&root).map_err(|e| e.to_string())?;
+    let title = humanize_slug(&slug);
+    write_workspace_config(
+        &root,
+        &WorkspaceConfig {
+            title: Some(title.clone()),
+            channels: Some(default_channels_for_workspace_slug(&slug)),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    let default_channels = default_channels_for_workspace_slug(&slug);
+    Ok(WorkspaceEntry {
+        slug: slug.clone(),
+        title,
+        path: root.to_string_lossy().to_string(),
+        channels: default_channels,
+    })
+}
+
+#[tauri::command]
+fn update_workspace(
+    workspace_slug: String,
+    workspace_path: String,
+    title: String,
+    channels: Vec<String>,
+) -> Result<WorkspaceEntry, String> {
+    let workspace_root = PathBuf::from(&workspace_path);
+    if !workspace_root.exists() || !workspace_root.is_dir() {
+        return Err("workspace path not found".to_string());
+    }
+
+    let normalized_title = title.trim().to_string();
+    let final_title = if normalized_title.is_empty() {
+        humanize_slug(&workspace_slug)
+    } else {
+        normalized_title
+    };
+    let normalized_channels = normalize_channels(channels);
+    write_workspace_config(
+        &workspace_root,
+        &WorkspaceConfig {
+            title: Some(final_title.clone()),
+            channels: Some(normalized_channels.clone()),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(WorkspaceEntry {
+        slug: workspace_slug,
+        title: final_title,
+        path: workspace_path,
+        channels: normalized_channels,
+    })
+}
+
+#[tauri::command]
+fn add_workspace_knowledge_files(
+    workspace_path: String,
+    source_paths: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let workspace_root = PathBuf::from(workspace_path);
+    let knowledge_dir = workspace_root.join("knowledge");
+    fs::create_dir_all(&knowledge_dir).map_err(|e| e.to_string())?;
+
+    let mut added = Vec::new();
+    for source in source_paths {
+        let source_path = PathBuf::from(source);
+        if !source_path.exists() || !source_path.is_file() {
+            continue;
+        }
+        let file_name = source_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("knowledge.bin");
+        let target = unique_name_in_dir(&knowledge_dir, file_name);
+        fs::copy(&source_path, &target).map_err(|e| e.to_string())?;
+        let rel = target
+            .strip_prefix(&workspace_root)
+            .unwrap_or(&target)
+            .to_string_lossy()
+            .replace('\\', "/");
+        added.push(rel);
+    }
+    Ok(added)
+}
+
+#[tauri::command]
+fn set_topic_tags(topic_slug: String, tags: Vec<String>) -> Result<(), String> {
+    let topic_dir = topic_dir_from_slug(&APP_STATE, &topic_slug).map_err(|e| e.to_string())?;
+    ensure_topic_contract_files(&topic_dir).map_err(|e| e.to_string())?;
+    let mut metadata = read_topic_metadata(&topic_dir);
+    let mut dedup = HashSet::new();
+    let normalized = tags
+        .into_iter()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .filter(|t| dedup.insert(t.to_ascii_lowercase()))
+        .collect::<Vec<String>>();
+    metadata.tags = Some(normalized.clone());
+    write_topic_metadata(&topic_dir, &metadata).map_err(|e| e.to_string())?;
+    let (_, _, _, _, db_path) = with_state_paths(&APP_STATE).map_err(|e| e.to_string())?;
+    let conn = db_conn(&db_path).map_err(|e| e.to_string())?;
+    log_event(
+        &conn,
+        "topic.tags_set",
+        serde_json::json!({ "topic_slug": topic_slug, "tags": normalized }),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn set_topic_master_file(topic_slug: String, source_path: String) -> Result<(), String> {
+    let topic_dir = topic_dir_from_slug(&APP_STATE, &topic_slug).map_err(|e| e.to_string())?;
+    ensure_topic_contract_files(&topic_dir).map_err(|e| e.to_string())?;
+    let source = PathBuf::from(source_path);
+    if !source.exists() || !source.is_file() {
+        return Err("source file not found".to_string());
+    }
+    let ext = source
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if ext != "md" && ext != "markdown" {
+        return Err("master file must be markdown (.md)".to_string());
+    }
+    fs::copy(source, topic_dir.join("master.md")).map_err(|e| e.to_string())?;
+    let mut metadata = read_topic_metadata(&topic_dir);
+    metadata.master = Some(MasterWorkflowState {
+        status: Some(
+            normalize_master_status(
+                metadata
+                    .master
+                    .as_ref()
+                    .and_then(|master| master.status.as_deref()),
+            ),
+        ),
+    });
+    write_topic_metadata(&topic_dir, &metadata).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn set_topic_master_status(topic_slug: String, status: String) -> Result<(), String> {
+    let topic_dir = topic_dir_from_slug(&APP_STATE, &topic_slug).map_err(|e| e.to_string())?;
+    ensure_topic_contract_files(&topic_dir).map_err(|e| e.to_string())?;
+    if !topic_has_master_file(&topic_dir) {
+        return Err("master file not found for topic".to_string());
+    }
+
+    let normalized_status = if status.eq_ignore_ascii_case("draft") {
+        "Draft".to_string()
+    } else if status.eq_ignore_ascii_case("ready") {
+        "Ready".to_string()
+    } else {
+        return Err("master status must be Draft or Ready".to_string());
+    };
+
+    let mut metadata = read_topic_metadata(&topic_dir);
+    metadata.master = Some(MasterWorkflowState {
+        status: Some(normalized_status.clone()),
+    });
+    write_topic_metadata(&topic_dir, &metadata).map_err(|e| e.to_string())?;
+
+    let (_, _, _, _, db_path) = with_state_paths(&APP_STATE).map_err(|e| e.to_string())?;
+    let conn = db_conn(&db_path).map_err(|e| e.to_string())?;
+    log_event(
+        &conn,
+        "topic.master_status_set",
+        serde_json::json!({ "topic_slug": topic_slug, "status": normalized_status }),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn add_topic_files(
+    topic_slug: String,
+    source_paths: Option<Vec<String>>,
+    target_dir: Option<String>,
+) -> Result<Vec<String>, String> {
+    let topic_dir = topic_dir_from_slug(&APP_STATE, &topic_slug).map_err(|e| e.to_string())?;
+    let target_rel = target_dir.unwrap_or_default();
+    let target_rel = if target_rel.trim().is_empty() {
+        String::new()
+    } else {
+        normalize_topic_rel_path(&target_rel).map_err(|e| e.to_string())?
+    };
+    let target_abs = if target_rel.is_empty() {
+        topic_dir.clone()
+    } else {
+        topic_dir.join(&target_rel)
+    };
+    fs::create_dir_all(&target_abs).map_err(|e| e.to_string())?;
+    let mut added = Vec::new();
+    for source in source_paths.unwrap_or_default() {
+        let source_path = PathBuf::from(source);
+        if !source_path.exists() || !source_path.is_file() {
+            continue;
+        }
+        let name = source_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file.bin");
+        let target = unique_name_in_dir(&target_abs, name);
+        fs::copy(&source_path, &target).map_err(|e| e.to_string())?;
+        added.push(relative_unix(&topic_dir, &target));
+    }
+    Ok(added)
+}
+
+#[tauri::command]
+fn replace_topic_file(
+    topic_slug: String,
+    rel_path: String,
+    source_path: String,
+) -> Result<(), String> {
+    let topic_dir = topic_dir_from_slug(&APP_STATE, &topic_slug).map_err(|e| e.to_string())?;
+    let source_abs = PathBuf::from(source_path);
+    if !source_abs.exists() || !source_abs.is_file() {
+        return Err("source file not found".to_string());
+    }
+    let rel = normalize_topic_rel_path(&rel_path).map_err(|e| e.to_string())?;
+    if let Some(reason) = topic_contract_block_reason(&rel) {
+        return Err(format!("{}: {}", reason, rel));
+    }
+    let target_abs = topic_dir.join(&rel);
+    if !target_abs.exists() || !target_abs.is_file() {
+        return Err(format!("target file not found: {}", rel));
+    }
+    fs::copy(source_abs, target_abs).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn rename_topic_file(
+    topic_slug: String,
+    rel_path: String,
+    new_rel_path: String,
+) -> Result<String, String> {
+    let topic_dir = topic_dir_from_slug(&APP_STATE, &topic_slug).map_err(|e| e.to_string())?;
+    let old_rel = normalize_topic_rel_path(&rel_path).map_err(|e| e.to_string())?;
+    let new_rel = normalize_topic_rel_path(&new_rel_path).map_err(|e| e.to_string())?;
+    if let Some(reason) = topic_contract_block_reason(&old_rel) {
+        return Err(format!("{}: {}", reason, old_rel));
+    }
+    if let Some(reason) = topic_contract_block_reason(&new_rel) {
+        return Err(format!("{}: {}", reason, new_rel));
+    }
+    let old_abs = topic_dir.join(&old_rel);
+    if !old_abs.exists() {
+        return Err(format!("file not found: {}", old_rel));
+    }
+    let mut target_abs = topic_dir.join(&new_rel);
+    if target_abs.exists() {
+        let file_name = target_abs
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| "invalid target file name".to_string())?;
+        let parent = target_abs
+            .parent()
+            .ok_or_else(|| "invalid target path".to_string())?;
+        target_abs = unique_name_in_dir(parent, file_name);
+    }
+    if let Some(parent) = target_abs.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    fs::rename(&old_abs, &target_abs).map_err(|e| e.to_string())?;
+    let final_rel = relative_unix(&topic_dir, &target_abs);
+
+    let mut metadata = read_topic_metadata(&topic_dir);
+    if let Some(files) = metadata.files.as_mut() {
+        if let Some(entry) = files.remove(&old_rel) {
+            files.insert(final_rel.clone(), entry);
+        }
+    }
+    if let Some(deployments) = metadata.deployments.as_mut() {
+        if let Some(entry) = deployments.remove(&old_rel) {
+            deployments.insert(final_rel.clone(), entry);
+        }
+    }
+    write_topic_metadata(&topic_dir, &metadata).map_err(|e| e.to_string())?;
+    Ok(final_rel)
+}
+
+#[tauri::command]
+fn delete_topic_file(topic_slug: String, rel_path: String) -> Result<(), String> {
+    let topic_dir = topic_dir_from_slug(&APP_STATE, &topic_slug).map_err(|e| e.to_string())?;
+    let rel = normalize_topic_rel_path(&rel_path).map_err(|e| e.to_string())?;
+    if let Some(reason) = topic_contract_block_reason(&rel) {
+        return Err(format!("{}: {}", reason, rel));
+    }
+    let target = topic_dir.join(&rel);
+    if !target.exists() || !target.is_file() {
+        return Err(format!("file not found: {}", rel));
+    }
+    fs::remove_file(&target).map_err(|e| e.to_string())?;
+
+    let mut metadata = read_topic_metadata(&topic_dir);
+    if let Some(files) = metadata.files.as_mut() {
+        files.remove(&rel);
+    }
+    if let Some(deployments) = metadata.deployments.as_mut() {
+        deployments.remove(&rel);
+    }
+    write_topic_metadata(&topic_dir, &metadata).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_topic_master(topic_slug: String, confirm_token: String) -> Result<usize, String> {
+    if confirm_token != "delete-master-and-derivatives" {
+        return Err(
+            "master deletion requires explicit confirmation token; update the app and retry"
+                .to_string(),
+        );
+    }
+    let topic_dir = topic_dir_from_slug(&APP_STATE, &topic_slug).map_err(|e| e.to_string())?;
+    let deleted = delete_topic_master_and_derivatives(&topic_dir).map_err(|e| e.to_string())?;
+    let (_, _, _, _, db_path) = with_state_paths(&APP_STATE).map_err(|e| e.to_string())?;
+    let conn = db_conn(&db_path).map_err(|e| e.to_string())?;
+    log_event(
+        &conn,
+        "topic.master_deleted",
+        serde_json::json!({ "topic_slug": topic_slug, "derivatives_deleted": deleted }),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(deleted)
+}
+
+#[tauri::command]
 fn bootstrap_workspace(root_path: String) -> Result<BootstrapResponse, String> {
     let root = normalize_workspace_root(&PathBuf::from(root_path));
+    if let Some(parent_root) = workspace_parent_from_workspace_root(&root) {
+        ensure_workspace_parent_contract(&parent_root).map_err(|e| {
+            format!(
+                "workspace contract invalid at {}: {}",
+                parent_root.to_string_lossy(),
+                e
+            )
+        })?;
+    }
     let (inbox, projects, exports, db_path) = ensure_workspace(&root).map_err(|e| e.to_string())?;
 
     let conn = db_conn(&db_path).map_err(|e| e.to_string())?;
     migrate(&conn).map_err(|e| e.to_string())?;
 
     {
-        let mut guard = APP_STATE.inner.lock().map_err(|_| "state lock poisoned".to_string())?;
+        let mut guard = APP_STATE
+            .inner
+            .lock()
+            .map_err(|_| "state lock poisoned".to_string())?;
         guard.root_path = Some(root.clone());
         guard.inbox_path = Some(inbox.clone());
         guard.projects_path = Some(projects.clone());
@@ -1096,7 +2084,10 @@ fn start_watcher(app: AppHandle) -> Result<WatcherStatus, String> {
         .watch(&inbox, RecursiveMode::Recursive)
         .map_err(|e| e.to_string())?;
 
-    let mut guard = APP_STATE.inner.lock().map_err(|_| "state lock poisoned".to_string())?;
+    let mut guard = APP_STATE
+        .inner
+        .lock()
+        .map_err(|_| "state lock poisoned".to_string())?;
     guard.watcher = Some(watcher);
     guard.watcher_error = None;
 
@@ -1109,7 +2100,10 @@ fn start_watcher(app: AppHandle) -> Result<WatcherStatus, String> {
 
 #[tauri::command]
 fn get_watcher_status() -> Result<WatcherStatus, String> {
-    let guard = APP_STATE.inner.lock().map_err(|_| "state lock poisoned".to_string())?;
+    let guard = APP_STATE
+        .inner
+        .lock()
+        .map_err(|_| "state lock poisoned".to_string())?;
     Ok(WatcherStatus {
         watching: guard.watcher.is_some(),
         inbox_path: guard
@@ -1135,7 +2129,9 @@ fn list_projects() -> Result<Vec<Project>, String> {
     let conn = db_conn(&db_path).map_err(|e| e.to_string())?;
 
     let mut stmt = conn
-        .prepare("SELECT id, name, slug, created_at, updated_at FROM projects ORDER BY updated_at DESC")
+        .prepare(
+            "SELECT id, name, slug, created_at, updated_at FROM projects ORDER BY updated_at DESC",
+        )
         .map_err(|e| e.to_string())?;
 
     let rows = stmt
@@ -1214,7 +2210,10 @@ fn list_tasks(project_slug: Option<String>) -> Result<Vec<Task>, String> {
 }
 
 #[tauri::command]
-fn list_files(project_slug: Option<String>, task_id: Option<i64>) -> Result<Vec<ContentFile>, String> {
+fn list_files(
+    project_slug: Option<String>,
+    task_id: Option<i64>,
+) -> Result<Vec<ContentFile>, String> {
     let (_, _, _, _, db_path) = with_state_paths(&APP_STATE).map_err(|e| e.to_string())?;
     let conn = db_conn(&db_path).map_err(|e| e.to_string())?;
 
@@ -1380,6 +2379,29 @@ fn read_text_file(path: String) -> Result<String, String> {
 
 #[tauri::command]
 fn write_text_file(path: String, content: String) -> Result<(), String> {
+    let target = PathBuf::from(&path);
+    if target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.eq_ignore_ascii_case("topic.json"))
+        .unwrap_or(false)
+    {
+        return Err(
+            "topic.json is protected contract metadata; use dedicated topic metadata commands"
+                .to_string(),
+        );
+    }
+    if target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.eq_ignore_ascii_case("workspace.json"))
+        .unwrap_or(false)
+    {
+        return Err(
+            "workspace.json is protected contract metadata; use workspace update commands"
+                .to_string(),
+        );
+    }
     fs::write(path, content).map_err(|e| e.to_string())
 }
 
@@ -1398,6 +2420,7 @@ fn get_topic_detail(topic_slug: String) -> Result<TopicDetail, String> {
 #[tauri::command]
 fn get_derivative_state(topic_slug: String, rel_path: String) -> Result<DerivativeState, String> {
     let topic_dir = topic_dir_from_slug(&APP_STATE, &topic_slug).map_err(|e| e.to_string())?;
+    ensure_topic_contract_files(&topic_dir).map_err(|e| e.to_string())?;
     let metadata = read_topic_metadata(&topic_dir);
     let file_state = metadata
         .files
@@ -1405,102 +2428,62 @@ fn get_derivative_state(topic_slug: String, rel_path: String) -> Result<Derivati
         .and_then(|m| m.get(&rel_path))
         .cloned()
         .unwrap_or_default();
-    let deployments = metadata
-        .deployments
-        .as_ref()
-        .and_then(|m| m.get(&rel_path))
-        .cloned()
-        .unwrap_or_default();
-    let status = if !deployments.is_empty() {
+    let deployed_channels = deployed_channels_for_file(&rel_path, &metadata);
+    let status = if !deployed_channels.is_empty() {
         "Deployed".to_string()
     } else {
-        file_state.status.unwrap_or_else(|| "Review".to_string())
+        normalize_derivative_status(file_state.status.as_deref())
     };
     Ok(DerivativeState {
         status,
-        reviewed: file_state.reviewed.unwrap_or(false),
         notes: file_state.notes.unwrap_or_default(),
-        deployments,
+        deployed_channels,
     })
 }
 
 #[tauri::command]
-fn set_derivative_review_state(
+fn set_derivative_deploy_state(
     topic_slug: String,
     rel_path: String,
     status: String,
-    reviewed: bool,
     notes: String,
+    deployed_channels: Vec<String>,
 ) -> Result<(), String> {
     let topic_dir = topic_dir_from_slug(&APP_STATE, &topic_slug).map_err(|e| e.to_string())?;
+    ensure_topic_contract_files(&topic_dir).map_err(|e| e.to_string())?;
     let mut metadata = read_topic_metadata(&topic_dir);
-    let files = metadata.files.get_or_insert_with(std::collections::HashMap::new);
-    files.insert(
-        rel_path.clone(),
-        FileReviewState {
-            status: Some(status.clone()),
-            reviewed: Some(reviewed),
-            notes: Some(notes.clone()),
-        },
-    );
-    write_topic_metadata(&topic_dir, &metadata).map_err(|e| e.to_string())?;
-    let (_, _, _, _, db_path) = with_state_paths(&APP_STATE).map_err(|e| e.to_string())?;
-    let conn = db_conn(&db_path).map_err(|e| e.to_string())?;
-    log_event(
-        &conn,
-        "topic.review_state_set",
-        serde_json::json!({ "topic_slug": topic_slug, "rel_path": rel_path, "status": status, "reviewed": reviewed }),
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-#[tauri::command]
-fn mark_derivative_deployed(
-    topic_slug: String,
-    rel_path: String,
-    destination: String,
-    date: String,
-    url: Option<String>,
-    notes: Option<String>,
-) -> Result<(), String> {
-    let topic_dir = topic_dir_from_slug(&APP_STATE, &topic_slug).map_err(|e| e.to_string())?;
-    let mut metadata = read_topic_metadata(&topic_dir);
-    let deployments = metadata
-        .deployments
+    let normalized_channels = normalize_channels(deployed_channels);
+    let normalized_status = if normalized_channels.is_empty() {
+        normalize_derivative_status(Some(&status))
+    } else {
+        "Deployed".to_string()
+    };
+    let files = metadata
+        .files
         .get_or_insert_with(std::collections::HashMap::new);
-    let entries = deployments.entry(rel_path.clone()).or_insert_with(Vec::new);
-    entries.push(DeploymentEntry {
-        destination: destination.clone(),
-        date: date.clone(),
-        url: url.clone(),
-        notes: notes.clone(),
-        created_at: now_iso(),
-    });
-    let files = metadata.files.get_or_insert_with(std::collections::HashMap::new);
-    let current = files.get(&rel_path).cloned().unwrap_or_default();
     files.insert(
         rel_path.clone(),
-        FileReviewState {
-            status: current.status.or(Some("Ready".to_string())),
-            reviewed: Some(current.reviewed.unwrap_or(true)),
-            notes: Some(current.notes.unwrap_or_default()),
+        DerivativeWorkflowState {
+            status: Some(normalized_status.clone()),
+            notes: Some(notes.clone()),
+            deployed_channels: Some(normalized_channels.clone()),
+            reviewed: None,
         },
     );
+    if let Some(legacy_deployments) = metadata.deployments.as_mut() {
+        legacy_deployments.remove(&rel_path);
+    }
     write_topic_metadata(&topic_dir, &metadata).map_err(|e| e.to_string())?;
-
     let (_, _, _, _, db_path) = with_state_paths(&APP_STATE).map_err(|e| e.to_string())?;
     let conn = db_conn(&db_path).map_err(|e| e.to_string())?;
     log_event(
         &conn,
-        "topic.deployed",
+        "topic.deploy_state_set",
         serde_json::json!({
             "topic_slug": topic_slug,
             "rel_path": rel_path,
-            "destination": destination,
-            "date": date,
-            "url": url,
-            "notes": notes
+            "status": normalized_status,
+            "deployed_channels": normalized_channels
         }),
     )
     .map_err(|e| e.to_string())?;
@@ -1509,28 +2492,44 @@ fn mark_derivative_deployed(
 
 #[tauri::command]
 fn open_in_finder(path: String) -> Result<(), String> {
-    std::process::Command::new("open")
-        .arg(path)
+    let target = PathBuf::from(path);
+    if !target.exists() {
+        return Err(format!("path not found: {}", target.to_string_lossy()));
+    }
+    let status = std::process::Command::new("open")
+        .arg(&target)
         .status()
         .map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err("failed to open in Finder".to_string());
+    }
     Ok(())
 }
 
 #[tauri::command]
 fn open_file_externally(path: String) -> Result<(), String> {
-    std::process::Command::new("open")
-        .arg(path)
+    let target = PathBuf::from(path);
+    if !target.exists() {
+        return Err(format!("path not found: {}", target.to_string_lossy()));
+    }
+    let status = std::process::Command::new("open")
+        .arg(&target)
         .status()
         .map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err("failed to open file externally".to_string());
+    }
     Ok(())
 }
 
 #[tauri::command]
 fn rename_file(file_id: i64, new_rel_path: String) -> Result<(), String> {
-    let (_, _, projects_root, _, db_path) = with_state_paths(&APP_STATE).map_err(|e| e.to_string())?;
+    let (_, _, projects_root, _, db_path) =
+        with_state_paths(&APP_STATE).map_err(|e| e.to_string())?;
     let conn = db_conn(&db_path).map_err(|e| e.to_string())?;
 
-    let (_id, task_id, _old_rel, old_abs) = source_file_row(&conn, file_id).map_err(|e| e.to_string())?;
+    let (_id, task_id, _old_rel, old_abs) =
+        source_file_row(&conn, file_id).map_err(|e| e.to_string())?;
     let unique_rel = unique_rel_path(&conn, task_id, &new_rel_path).map_err(|e| e.to_string())?;
     let (_, task_dir) = task_folder(&conn, &projects_root, task_id).map_err(|e| e.to_string())?;
     fs::create_dir_all(&task_dir).map_err(|e| e.to_string())?;
@@ -1554,20 +2553,28 @@ fn rename_file(file_id: i64, new_rel_path: String) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
-    log_event(&conn, "file.renamed", serde_json::json!({ "file_id": file_id }))
-        .map_err(|e| e.to_string())?;
+    log_event(
+        &conn,
+        "file.renamed",
+        serde_json::json!({ "file_id": file_id }),
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
 fn move_file(file_id: i64, target_task_id: i64) -> Result<(), String> {
-    let (_, _, projects_root, _, db_path) = with_state_paths(&APP_STATE).map_err(|e| e.to_string())?;
+    let (_, _, projects_root, _, db_path) =
+        with_state_paths(&APP_STATE).map_err(|e| e.to_string())?;
     let conn = db_conn(&db_path).map_err(|e| e.to_string())?;
-    let (_id, _source_task_id, source_rel, source_abs) = source_file_row(&conn, file_id).map_err(|e| e.to_string())?;
-    let (target_project_id, target_dir) = task_folder(&conn, &projects_root, target_task_id).map_err(|e| e.to_string())?;
+    let (_id, _source_task_id, source_rel, source_abs) =
+        source_file_row(&conn, file_id).map_err(|e| e.to_string())?;
+    let (target_project_id, target_dir) =
+        task_folder(&conn, &projects_root, target_task_id).map_err(|e| e.to_string())?;
     fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
 
-    let target_rel = unique_rel_path(&conn, target_task_id, &source_rel).map_err(|e| e.to_string())?;
+    let target_rel =
+        unique_rel_path(&conn, target_task_id, &source_rel).map_err(|e| e.to_string())?;
     let target_abs = target_dir.join(&target_rel);
     if let Some(parent) = target_abs.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -1601,12 +2608,15 @@ fn move_file(file_id: i64, target_task_id: i64) -> Result<(), String> {
 
 #[tauri::command]
 fn duplicate_file(file_id: i64, target_task_id: Option<i64>) -> Result<i64, String> {
-    let (_, _, projects_root, _, db_path) = with_state_paths(&APP_STATE).map_err(|e| e.to_string())?;
+    let (_, _, projects_root, _, db_path) =
+        with_state_paths(&APP_STATE).map_err(|e| e.to_string())?;
     let conn = db_conn(&db_path).map_err(|e| e.to_string())?;
-    let (_id, source_task_id, source_rel, source_abs) = source_file_row(&conn, file_id).map_err(|e| e.to_string())?;
+    let (_id, source_task_id, source_rel, source_abs) =
+        source_file_row(&conn, file_id).map_err(|e| e.to_string())?;
     let destination_task = target_task_id.unwrap_or(source_task_id);
 
-    let (target_project_id, target_dir) = task_folder(&conn, &projects_root, destination_task).map_err(|e| e.to_string())?;
+    let (target_project_id, target_dir) =
+        task_folder(&conn, &projects_root, destination_task).map_err(|e| e.to_string())?;
     fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
     let (parent, stem, ext) = split_path_parts(&source_rel);
     let duplicate_name = if parent.is_empty() {
@@ -1614,7 +2624,8 @@ fn duplicate_file(file_id: i64, target_task_id: Option<i64>) -> Result<i64, Stri
     } else {
         format!("{}/{}-copy{}", parent, stem, ext)
     };
-    let target_rel = unique_rel_path(&conn, destination_task, &duplicate_name).map_err(|e| e.to_string())?;
+    let target_rel =
+        unique_rel_path(&conn, destination_task, &duplicate_name).map_err(|e| e.to_string())?;
     let target_abs = target_dir.join(&target_rel);
     if let Some(parent) = target_abs.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -1670,11 +2681,23 @@ fn main() {
             list_topics,
             get_topic_detail,
             get_derivative_state,
-            set_derivative_review_state,
-            mark_derivative_deployed,
+            set_derivative_deploy_state,
             open_in_finder,
             open_file_externally,
             create_topic,
+            delete_topic,
+            list_workspaces,
+            create_workspace,
+            update_workspace,
+            add_workspace_knowledge_files,
+            set_topic_tags,
+            set_topic_master_file,
+            set_topic_master_status,
+            add_topic_files,
+            replace_topic_file,
+            rename_topic_file,
+            delete_topic_file,
+            delete_topic_master,
             rename_file,
             move_file,
             duplicate_file,
@@ -1687,8 +2710,10 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_export_bundle, db_conn, ensure_workspace, hash_file, import_scan, migrate, read_manifest,
-        slugify, status_transition_allowed, AppState,
+        build_export_bundle, create_topic_in_inbox, db_conn, delete_topic_master_and_derivatives,
+        ensure_workspace, ensure_workspace_parent_contract, hash_file, import_scan, migrate,
+        read_manifest, slugify, status_transition_allowed, topic_contract_block_reason,
+        write_text_file, AppState,
     };
     use rusqlite::Connection;
     use std::fs;
@@ -1826,5 +2851,180 @@ mod tests {
         assert!(bundle_path.join("index.html").exists());
         assert!(bundle_path.join("content.txt").exists());
         assert!(bundle_path.join("manifest.json").exists());
+    }
+
+    #[test]
+    fn workspace_parent_contract_scaffold_creates_required_files() {
+        let tmp = TempDir::new().expect("temp dir");
+        let parent = tmp.path().join("workspace-parent");
+        ensure_workspace_parent_contract(&parent).expect("parent scaffold");
+        assert!(parent.join("instructions.md").exists());
+        assert!(parent.join("workspaces").exists());
+    }
+
+    #[test]
+    fn ensure_workspace_creates_layer2_contract_paths() {
+        let tmp = TempDir::new().expect("temp dir");
+        let workspace_root = tmp.path().join("workspaces").join("alpha-workspace");
+        let (inbox, projects, exports, db_path) =
+            ensure_workspace(&workspace_root).expect("workspace scaffold");
+        assert!(inbox.exists());
+        assert!(projects.exists());
+        assert!(exports.exists());
+        assert!(workspace_root.join("data").exists());
+        assert_eq!(db_path, workspace_root.join("data").join("app.db"));
+        assert!(workspace_root.join("knowledge").join("workspace.md").exists());
+    }
+
+    #[test]
+    fn create_topic_scaffold_creates_master_metadata_and_assets() {
+        let tmp = TempDir::new().expect("temp dir");
+        let inbox = tmp.path().join("inbox");
+        fs::create_dir_all(&inbox).expect("create inbox");
+        let master_source = tmp.path().join("master-source.md");
+        fs::write(&master_source, "# Provided source\n\nThis should be copied verbatim.\n")
+            .expect("write master source");
+
+        let (_slug, topic_dir, _source, _assets_added) = create_topic_in_inbox(
+            &inbox,
+            "Launch Wave",
+            Some(master_source.to_string_lossy().to_string()),
+            None,
+        )
+        .expect("create topic");
+
+        assert!(topic_dir.join("master.md").exists());
+        assert!(topic_dir.join("topic.json").exists());
+        assert!(topic_dir.join("assets").exists());
+        let copied_master = fs::read_to_string(topic_dir.join("master.md")).expect("read copied master");
+        assert!(copied_master.contains("This should be copied verbatim."));
+    }
+
+    #[test]
+    fn create_topic_without_master_source_builds_blank_template() {
+        let tmp = TempDir::new().expect("temp dir");
+        let inbox = tmp.path().join("inbox");
+        fs::create_dir_all(&inbox).expect("create inbox");
+
+        let (_slug, topic_dir, source, _assets_added) =
+            create_topic_in_inbox(&inbox, "No Source Topic", None, None).expect("create topic");
+        assert_eq!(source, "__generated_template__");
+
+        let master = fs::read_to_string(topic_dir.join("master.md")).expect("read generated master");
+        assert!(master.contains("[No Source Topic]"));
+        assert!(master.contains("[no-source-topic]"));
+        assert!(master.contains("[goal]"));
+    }
+
+    #[test]
+    fn create_topic_with_blank_master_source_string_uses_template() {
+        let tmp = TempDir::new().expect("temp dir");
+        let inbox = tmp.path().join("inbox");
+        fs::create_dir_all(&inbox).expect("create inbox");
+
+        let (_slug, topic_dir, source, _assets_added) = create_topic_in_inbox(
+            &inbox,
+            "Blank Source Topic",
+            Some("   ".to_string()),
+            None,
+        )
+        .expect("create topic with blank source");
+
+        assert_eq!(source, "__generated_template__");
+        assert!(topic_dir.join("master.md").exists());
+    }
+
+    #[test]
+    fn create_topic_with_invalid_master_source_does_not_leave_partial_topic() {
+        let tmp = TempDir::new().expect("temp dir");
+        let inbox = tmp.path().join("inbox");
+        fs::create_dir_all(&inbox).expect("create inbox");
+
+        let invalid_source = tmp.path().join("does-not-exist.md");
+        let err = create_topic_in_inbox(
+            &inbox,
+            "Broken Source Topic",
+            Some(invalid_source.to_string_lossy().to_string()),
+            None,
+        )
+        .expect_err("invalid source must fail");
+        assert!(err.to_string().contains("master source not found"));
+        assert!(!inbox.join("broken-source-topic").exists());
+    }
+
+    #[test]
+    fn delete_topic_master_removes_derivatives_and_keeps_assets() {
+        let tmp = TempDir::new().expect("temp dir");
+        let topic_dir = tmp.path().join("topic");
+        fs::create_dir_all(topic_dir.join("assets")).expect("create assets");
+        fs::write(topic_dir.join("master.md"), "# master").expect("master");
+        fs::write(topic_dir.join("topic.json"), "{}").expect("metadata");
+        fs::write(topic_dir.join("email-topic.html"), "<p>x</p>").expect("derivative");
+        fs::write(topic_dir.join("assets").join("hero.png"), "bytes").expect("asset");
+
+        let deleted = delete_topic_master_and_derivatives(&topic_dir).expect("delete master");
+        assert_eq!(deleted, 1);
+        assert!(!topic_dir.join("master.md").exists());
+        assert!(!topic_dir.join("email-topic.html").exists());
+        assert!(topic_dir.join("assets").join("hero.png").exists());
+        assert!(topic_dir.join("topic.json").exists());
+    }
+
+    #[test]
+    fn protected_topic_contract_paths_are_flagged() {
+        assert!(topic_contract_block_reason("topic.json").is_some());
+        assert!(topic_contract_block_reason("master.md").is_some());
+        assert!(topic_contract_block_reason("assets/hero.png").is_some());
+        assert!(topic_contract_block_reason("derivatives/email.html").is_none());
+    }
+
+    #[test]
+    fn write_text_file_blocks_protected_metadata_files() {
+        let tmp = TempDir::new().expect("temp dir");
+        let topic_meta = tmp.path().join("topic.json");
+        let workspace_meta = tmp.path().join("workspace.json");
+        let regular = tmp.path().join("notes.md");
+        fs::write(&topic_meta, "{}").expect("seed topic metadata");
+        fs::write(&workspace_meta, "{}").expect("seed workspace metadata");
+        fs::write(&regular, "before").expect("seed regular file");
+
+        let topic_err = write_text_file(topic_meta.to_string_lossy().to_string(), "{}".to_string())
+            .expect_err("topic.json should be blocked");
+        assert!(topic_err.contains("protected contract metadata"));
+
+        let workspace_err = write_text_file(
+            workspace_meta.to_string_lossy().to_string(),
+            "{}".to_string(),
+        )
+        .expect_err("workspace.json should be blocked");
+        assert!(workspace_err.contains("protected contract metadata"));
+
+        write_text_file(
+            regular.to_string_lossy().to_string(),
+            "after".to_string(),
+        )
+        .expect("regular markdown file should remain writable");
+        let value = fs::read_to_string(regular).expect("read regular file");
+        assert_eq!(value, "after");
+    }
+
+    #[test]
+    fn migration_is_idempotent_and_does_not_create_openclaw_tables() {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("app.db");
+        let conn = db_conn(&db_path).expect("db");
+        migrate(&conn).expect("first migrate");
+        migrate(&conn).expect("second migrate");
+
+        for table in ["openclaw_settings", "openclaw_runs", "openclaw_run_logs"] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("query sqlite_master");
+            assert_eq!(count, 0, "unexpected table {}", table);
+        }
     }
 }

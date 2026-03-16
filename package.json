@@ -1,19 +1,32 @@
 {
-  "name": "local-ai-draft-workspace",
+  "name": "content-shotgun",
   "private": true,
   "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "scaffold:workspace": "node scripts/scaffold-workspace.mjs",
+    "validate:workspace-contract": "node scripts/validate-workspace-contract.mjs",
+    "test:workspace-contract": "node --test tests/workspace-contract.test.mjs",
+    "test:editor-content": "rm -rf .tmp-tests && tsc src/editorContent.ts src/topicSelection.ts src/imageEditorSource.ts --module NodeNext --target ES2020 --moduleResolution NodeNext --lib ES2020,DOM --outDir .tmp-tests --rootDir src && node --test tests/editor-content.test.mjs tests/topic-selection.test.mjs tests/image-editor-source.test.mjs",
+    "test:smoke": "npm run build && npm run test:editor-content && npm run test:workspace-contract",
+    "check:topic-preview-flow": "rm -rf .tmp-tests && tsc src/editorContent.ts src/topicSelection.ts src/imageEditorSource.ts --module NodeNext --target ES2020 --moduleResolution NodeNext --lib ES2020,DOM --outDir .tmp-tests --rootDir src && node --test tests/topic-selection.test.mjs tests/image-editor-source.test.mjs",
     "preview": "vite preview",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build"
   },
   "dependencies": {
+    "@heroicons/react": "^2.2.0",
+    "@milkdown/crepe": "^7.18.0",
     "@tauri-apps/api": "^1.6.0",
+    "grapesjs": "^0.22.14",
+    "konva": "^9.3.6",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "react-filerobot-image-editor": "^4.9.1",
+    "react-konva": "^18.2.14",
+    "styled-components": "^5.3.11"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^1.6.3",

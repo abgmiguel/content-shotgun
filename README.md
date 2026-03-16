@@ -1,68 +1,72 @@
-# Local AI Draft Workspace
+# Content Shotgun
 
-Local-first Tauri + React app for AI-assisted marketing draft workflows.
+Content Shotgun is a local-first Tauri + React app for workspace/topic content production with deterministic folder contracts.
 
-## Features
-- 3-pane topic UI:
-  - Left: search + topic list + filters
-  - Center: topic relationship tree (master/assets/derivatives)
-  - Right: edit/review/deploy tabs
-- Topic source of truth from local folders: `workspace/inbox/<topic_slug>/`
-- Topic status and derivative review/deploy state stored in `topic.json` per topic
-- HTML editing with preview, path visibility, and external-open actions
-- Deployment log per derivative (destination/date/url/notes)
-- SQLite event log and legacy ingestion/export services remain available
+## Canonical Contract
+Layer 1 (repo identity/routing):
+- `CLAUDE.md` (canonical)
+- `AGENTS.md` (compatibility pointer)
 
-## Agent Inbox Contract
-Drop files into:
+Layer 2 (runtime workspace contract):
+- `<workspace-parent>/instructions.md`
+- `<workspace-parent>/workspaces/<workspace-slug>/knowledge/workspace.md`
+- `<workspace-parent>/workspaces/<workspace-slug>/inbox/<topic-slug>/master.md`
+- `<workspace-parent>/workspaces/<workspace-slug>/inbox/<topic-slug>/topic.json`
+- `<workspace-parent>/workspaces/<workspace-slug>/inbox/<topic-slug>/assets/`
 
-```text
-workspace/inbox/<project_slug>/
-```
+Layer 3 (Content Machine layered collaboration instructions):
+- `content-machine/instructions/01-global/INSTRUCTIONS.md`
+- `content-machine/instructions/02-workspace/INSTRUCTIONS.md`
+- `content-machine/instructions/03-topic/INSTRUCTIONS.md`
 
-Supported:
-- `*.html` (canonical)
-- optional `*.md`, `*.txt`
-- optional `master.md` or `master.html`
-- optional `assets/` or `images/` folder
-- optional `task.json`
-- optional `topic.json` (app creates/updates this for review/deployment metadata)
+OpenClaw skill boundary:
+- `skills/openclaw/SKILL.md` (single bridge skill only)
 
-Example `task.json`:
-
-```json
-{
-  "title": "Launch email v1",
-  "type": "email",
-  "priority": "high",
-  "due_date": "2026-02-15",
-  "tags": ["launch", "email"],
-  "notes": "Focus on conversion CTA"
-}
-```
-
-## Run
-Prereqs:
+## Quick Start
+Prerequisites:
 - Node 20+
-- Rust toolchain (`rustup`) for Tauri
+- Rust toolchain (`rustup`)
 
+Install dependencies:
 ```bash
-npm install
+npm ci
+```
+
+Scaffold a workspace parent + workspace contract:
+```bash
+npm run scaffold:workspace -- --parent ./workspace --workspace "Content Shotgun"
+```
+
+Run the app:
+```bash
 npm run tauri:dev
 ```
 
-Path note:
-- You can initialize with `./workspace`, `./workspace/inbox`, or a specific topic folder under `inbox`; the app normalizes to workspace root automatically.
+## Commands
+- `npm run scaffold:workspace`
+  - Creates canonical workspace parent/workspace structure.
+- `npm run validate:workspace-contract`
+  - Validates Layer 1 + Layer 2 with deterministic error codes.
+- `npm run build`
+  - TypeScript + Vite build.
+- `npm run test:editor-content`
+  - Frontend contract/unit tests.
+- `npm run test:workspace-contract`
+  - Workspace scaffold/validator test suite.
+- `cd src-tauri && cargo test --locked`
+  - Rust tests.
 
-## Tests
-Rust tests (after Rust installation):
+## CI Gates
+PR CI runs:
+- Frontend build
+- Frontend/unit tests
+- Workspace contract test suite
+- Rust tests (`cargo test --locked`)
 
-```bash
-cd src-tauri
-cargo test
-```
+## Architecture Notes
+- Workspace creation/bootstrap materializes required contract files and folders.
+- Topic creation always establishes `master.md`, `topic.json`, and `assets/`.
+- Protected contract files are blocked from unsafe rename/delete/replace flows.
 
-## Current Limitations
-- No cloud sync or direct publish integrations
-- Editor is HTML text + preview (block-like workflow via formatting conventions)
-- Rust toolchain must be installed to run desktop shell
+## Contributor Workflow
+See `CONTRIBUTING.md` for setup, branch/PR workflow, and troubleshooting.

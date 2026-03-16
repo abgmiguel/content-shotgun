@@ -1,5 +1,6 @@
-export type DerivativeStatus = "New" | "Review" | "Ready" | "Deployed";
+export type DerivativeStatus = "Draft" | "Revised" | "Deployed";
 export type TopicStatus = "Needs Review" | "Ready" | "Deployed";
+export type MasterStatus = "Draft" | "Ready";
 
 export interface BootstrapResponse {
   root_path: string;
@@ -17,57 +18,58 @@ export interface WatcherStatus {
 export interface TopicSummary {
   slug: string;
   title: string;
-  folder_path: string;
-  last_modified: number;
-  last_agent_write: number;
-  topic_status: TopicStatus;
+  folderPath: string;
+  lastModified: number;
+  lastAgentWrite: number;
+  topicStatus: TopicStatus;
   tags: string[];
-  review_count: number;
+  reviewCount: number;
 }
 
 export interface DerivativeEntry {
-  rel_path: string;
+  relPath: string;
   title: string;
   kind: string;
   status: DerivativeStatus;
-  deployed_count: number;
-  modified_at: number;
+  deployedCount: number;
+  deployedChannels: string[];
+  modifiedAt: number;
 }
 
 export interface AssetEntry {
-  rel_path: string;
-  abs_path: string;
-  modified_at: number;
-  is_image: boolean;
+  relPath: string;
+  absPath: string;
+  modifiedAt: number;
+  isImage: boolean;
+  isVideo: boolean;
 }
 
 export interface TopicDetail {
   slug: string;
   title: string;
-  folder_path: string;
-  last_modified: number;
-  last_agent_write: number;
-  topic_status: TopicStatus;
+  folderPath: string;
+  lastModified: number;
+  lastAgentWrite: number;
+  topicStatus: TopicStatus;
   tags: string[];
-  master_file: string | null;
+  masterFile: string | null;
+  masterStatus: MasterStatus;
+  masterModifiedAt: number | null;
   derivatives: DerivativeEntry[];
   assets: AssetEntry[];
-  deployments: Record<string, DeploymentEntry[]>;
 }
 
-export interface DeploymentEntry {
-  destination: string;
-  date: string;
-  url?: string | null;
-  notes?: string | null;
-  created_at: string;
+export interface WorkspaceEntry {
+  slug: string;
+  title: string;
+  path: string;
+  channels: string[];
 }
 
 export interface DerivativeState {
   status: DerivativeStatus;
-  reviewed: boolean;
   notes: string;
-  deployments: DeploymentEntry[];
+  deployedChannels: string[];
 }
 
-export type GlobalFilter = "all" | "needs_review" | "ready_not_deployed" | "klaviyo_30d";
+export type GlobalFilter = "all" | "needs_review" | "ready_not_deployed";

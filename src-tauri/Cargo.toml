@@ -1,7 +1,7 @@
 [package]
-name = "local_ai_draft_workspace"
+name = "content_shotgun"
 version = "0.1.0"
-description = "Local AI Draft Workspace"
+description = "Content Shotgun"
 authors = ["Miguel"]
 license = "MIT"
 edition = "2021"
@@ -19,7 +19,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
-tauri = { version = "1.7", features = [ "dialog-all", "fs-all", "path-all"] }
+tauri = { version = "1.7", features = [ "window-all", "protocol-asset", "dialog-all", "fs-all", "path-all"] }
 walkdir = "2.5"
 
 [features]

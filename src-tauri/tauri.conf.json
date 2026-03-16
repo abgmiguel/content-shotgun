@@ -3,11 +3,11 @@
   "build": {
     "beforeBuildCommand": "npm run build",
     "beforeDevCommand": "npm run dev",
-    "devPath": "http://localhost:5173",
+    "devPath": "http://127.0.0.1:5173",
     "distDir": "../dist"
   },
   "package": {
-    "productName": "Local AI Draft Workspace",
+    "productName": "Content Shotgun",
     "version": "0.1.0"
   },
   "tauri": {
@@ -22,15 +22,25 @@
       },
       "dialog": {
         "all": true
+      },
+      "window": {
+        "all": true
+      },
+      "protocol": {
+        "asset": true,
+        "assetScope": ["**"]
       }
     },
     "bundle": {
       "active": false,
-      "identifier": "com.miguel.localaidraftworkspace"
+      "identifier": "com.miguel.contentshotgun"
+    },
+    "security": {
+      "csp": "default-src 'self' asset: data: blob: https:; connect-src 'self' ipc: http://ipc.localhost http://localhost:5173 http://127.0.0.1:5173 ws://localhost:5173 ws://127.0.0.1:5173 https:; img-src 'self' asset: data: blob: https:; media-src 'self' asset: data: blob: https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline';"
     },
     "windows": [
       {
-        "title": "Local AI Draft Workspace",
+        "title": "Content Shotgun",
         "width": 1600,
         "height": 950,
         "resizable": true
