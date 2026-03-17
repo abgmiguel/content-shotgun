@@ -50,6 +50,13 @@ jobs:
           rustc --version
           cargo --version
 
+      - name: Ensure distDir exists for Tauri config checks
+        run: |
+          mkdir -p ../dist
+          if [ ! -f ../dist/index.html ]; then
+            echo '<!doctype html><html><body>CI placeholder</body></html>' > ../dist/index.html
+          fi
+
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
